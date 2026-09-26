@@ -1,0 +1,4 @@
+/_build/
+/deps/
+/priv/graph/
+erl_crash.dump
