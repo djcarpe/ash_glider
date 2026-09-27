@@ -25,6 +25,8 @@ defmodule AshGlider.Edge do
   created in Elixir is visible in `glider browser` and vice versa.
   """
 
+  require Glider.Query, as: Q
+
   alias AshGlider.{DataLayer, Info, Type}
 
   @type record :: Ash.Resource.record()
@@ -40,17 +42,17 @@ defmodule AshGlider.Edge do
   """
   @spec relate(record(), rel_type(), record(), map()) :: :ok | {:error, term()}
   def relate(from, type, to, props \\ %{}) do
-    with {:ok, from_pattern} <- node_pattern(from, "a"),
-         {:ok, to_pattern} <- node_pattern(to, "b") do
-      handle = Info.handle(from.__struct__)
-      prop_text = edge_props(props)
+    with {:ok, a} <- node_pattern(from, :a),
+         {:ok, b} <- node_pattern(to, :b) do
+      props = props |> Enum.reject(fn {_k, v} -> is_nil(v) end) |> Map.new(fn {k, v} -> {k, Type.encode(v)} end)
 
-      query = """
-      MATCH #{from_pattern}, #{to_pattern} \
-      CREATE (a)-[:#{type}#{prop_text}]->(b)\
-      """
+      q =
+        a
+        |> Q.match()
+        |> Q.match(b)
+        |> Q.create(Q.edge(:a, to_string(type), :b, props))
 
-      case Glider.query(handle, query) do
+      case Glider.query(handle(from), q) do
         {:ok, %{touched: 0}} -> {:error, :endpoint_not_found}
         {:ok, _} -> :ok
         {:error, reason} -> {:error, reason}
@@ -63,15 +65,11 @@ defmodule AshGlider.Edge do
   """
   @spec unrelate(record(), rel_type(), record()) :: {:ok, non_neg_integer()} | {:error, term()}
   def unrelate(from, type, to) do
-    with {:ok, from_pattern} <- node_pattern(from, "a"),
-         {:ok, to_pattern} <- node_pattern(to, "b") do
-      handle = Info.handle(from.__struct__)
+    with {:ok, a} <- node_pattern(from, :a),
+         {:ok, b} <- node_pattern(to, :b) do
+      q = path_pattern(a, "-[r:" <> Q.ident(to_string(type)) <> "]->", b) |> Q.match() |> Q.delete(:r)
 
-      query = """
-      MATCH #{from_pattern}-[r:#{type}]->#{to_pattern} DELETE r\
-      """
-
-      case Glider.query(handle, query) do
+      case Glider.query(handle(from), q) do
         {:ok, %{touched: n}} -> {:ok, n}
         {:error, reason} -> {:error, reason}
       end
@@ -97,14 +95,9 @@ defmodule AshGlider.Edge do
   """
   @spec related(record(), rel_type(), keyword()) :: {:ok, [record()]} | {:error, term()}
   def related(record, type, opts \\ []) do
-    resource = record.__struct__
-    destination = Keyword.get(opts, :destination, resource)
+    destination = Keyword.get(opts, :destination, record.__struct__)
 
-    with {:ok, pattern} <- node_pattern(record, "a") do
-      handle = Info.handle(resource)
-      hops = hop_spec(Keyword.get(opts, :depth))
-      dest_label = Info.label(destination)
-
+    with {:ok, a} <- node_pattern(record, :a) do
       {left, right} =
         case Keyword.get(opts, :direction, :out) do
           :out -> {"-", "->"}
@@ -112,16 +105,21 @@ defmodule AshGlider.Edge do
           :both -> {"-", "-"}
         end
 
-      limit =
+      hop = left <> "[:" <> Q.ident(to_string(type)) <> hop_spec(Keyword.get(opts, :depth)) <> "]" <> right
+
+      q =
+        path_pattern(a, hop, Q.vertex(:b, to_string(Info.label(destination))))
+        |> Q.match()
+        |> Q.return(b)
+        |> Q.distinct()
+
+      q =
         case Keyword.get(opts, :limit) do
-          nil -> ""
-          n when is_integer(n) -> " LIMIT #{n}"
+          nil -> q
+          n when is_integer(n) and n >= 0 -> Q.limit(q, ^n)
         end
 
-      query =
-        "MATCH #{pattern}#{left}[:#{type}#{hops}]#{right}(b:#{dest_label}) RETURN DISTINCT b#{limit}"
-
-      case Glider.query(handle, query) do
+      case Glider.query(handle(record), q) do
         {:ok, %{rows: rows}} -> load_nodes(rows, destination)
         {:error, reason} -> {:error, reason}
       end
@@ -136,11 +134,11 @@ defmodule AshGlider.Edge do
   """
   @spec edges_between(record(), record()) :: {:ok, [map()]} | {:error, term()}
   def edges_between(from, to) do
-    with {:ok, from_pattern} <- node_pattern(from, "a"),
-         {:ok, to_pattern} <- node_pattern(to, "b") do
-      handle = Info.handle(from.__struct__)
+    with {:ok, a} <- node_pattern(from, :a),
+         {:ok, b} <- node_pattern(to, :b) do
+      q = path_pattern(a, "-[r]->", b) |> Q.match() |> Q.return(r)
 
-      case Glider.query(handle, "MATCH #{from_pattern}-[r]->#{to_pattern} RETURN r") do
+      case Glider.query(handle(from), q) do
         {:ok, %{rows: rows}} ->
           {:ok, Enum.map(rows, fn [%Glider.Rel{type: t, props: p}] -> %{type: t, props: p} end)}
 
@@ -161,20 +159,19 @@ defmodule AshGlider.Edge do
 
     with {:ok, from_id} <- node_id(from),
          {:ok, to_id} <- node_id(to) do
-      handle = Info.handle(resource)
+      args =
+        [from: from_id, to: to_id] ++
+          case Keyword.get(opts, :type) do
+            nil -> []
+            t -> [type: to_string(t)]
+          end
 
-      type_arg =
-        case Keyword.get(opts, :type) do
-          nil -> ""
-          t -> ~s|, type: "#{t}"|
-        end
-
-      case Glider.query(handle, "CALL shortestpath(from: #{from_id}, to: #{to_id}#{type_arg})") do
+      case Glider.query(handle(from), Q.call(:shortestpath, args)) do
         {:ok, %{rows: rows}} ->
           # shortestpath returns step/id/node columns; the ids are what we need
           # in order to load the records back through the data layer.
           ids = Enum.map(rows, fn row -> Enum.at(row, 1) end)
-          load_by_internal_ids(handle, ids, Keyword.get(opts, :destination, resource))
+          load_by_internal_ids(handle(from), ids, Keyword.get(opts, :destination, resource))
 
         {:error, reason} ->
           {:error, reason}
@@ -197,13 +194,9 @@ defmodule AshGlider.Edge do
   """
   @spec algorithm(Ash.Resource.t(), atom(), keyword()) :: {:ok, list()} | {:error, term()}
   def algorithm(resource, name, args \\ []) do
-    handle = Info.handle(resource)
+    args = Enum.map(args, fn {k, v} -> {k, if(is_atom(v) and not is_boolean(v), do: to_string(v), else: v)} end)
 
-    arg_text =
-      args
-      |> Enum.map_join(", ", fn {k, v} -> "#{k}: #{arg_literal(v)}" end)
-
-    case Glider.query(handle, "CALL #{name}(#{arg_text})") do
+    case Glider.query(Info.handle(resource), Q.call(name, args)) do
       {:ok, result} -> {:ok, result.rows}
       {:error, reason} -> {:error, reason}
     end
@@ -211,70 +204,30 @@ defmodule AshGlider.Edge do
 
   # ------------------------------------------------------------------ private
 
-  defp arg_literal(v) when is_integer(v) or is_float(v), do: to_string(v)
-  defp arg_literal(true), do: "true"
-  defp arg_literal(false), do: "false"
-  defp arg_literal(v) when is_binary(v), do: DataLayer.quote_string(v)
-  defp arg_literal(v) when is_atom(v), do: DataLayer.quote_string(Atom.to_string(v))
+  defp handle(record), do: Info.handle(record.__struct__)
 
   defp hop_spec(nil), do: ""
   defp hop_spec(first..last//_), do: "*#{first}..#{last}"
   defp hop_spec(n) when is_integer(n), do: "*#{n}..#{n}"
 
-  defp edge_props(props) when props == %{}, do: ""
-
-  defp edge_props(props) do
-    text =
-      props
-      |> Enum.reject(fn {_k, v} -> is_nil(v) end)
-      |> Enum.map_join(", ", fn {k, v} -> "#{k}: #{literal(Type.encode(v))}" end)
-
-    " {" <> text <> "}"
-  end
-
-  defp literal(v) when is_binary(v), do: DataLayer.quote_string(v)
-  defp literal(v) when is_integer(v) or is_float(v), do: to_string(v)
-  defp literal(true), do: "true"
-  defp literal(false), do: "false"
-  defp literal(v) when is_list(v), do: "[" <> Enum.map_join(v, ", ", &literal/1) <> "]"
-  defp literal(nil), do: "null"
-
-  # `(a:Label {pk: value})` for one record.
+  # `(a:Label {pk: $param})` for one record.
   defp node_pattern(record, binding) do
     resource = record.__struct__
-    label = Info.label(resource)
 
-    case pk_pairs(record, resource) do
-      {:ok, pairs} ->
-        text = Enum.map_join(pairs, ", ", fn {k, v} -> "#{k}: #{literal(v)}" end)
-        {:ok, "(#{binding}:#{label} {#{text}})"}
-
-      error ->
-        error
+    case DataLayer.pk_props(record, resource) do
+      {:ok, pk} -> {:ok, Q.vertex(binding, to_string(Info.label(resource)), pk)}
+      {:error, _} -> {:error, {:bad_primary_key, Ash.Resource.Info.primary_key(resource)}}
     end
   end
 
-  defp pk_pairs(record, resource) do
-    resource
-    |> Ash.Resource.Info.primary_key()
-    |> Enum.reduce_while({:ok, []}, fn key, {:ok, acc} ->
-      attr = Ash.Resource.Info.attribute(resource, key)
-
-      case Ash.Type.dump_to_native(attr.type, Map.get(record, key), attr.constraints) do
-        {:ok, dumped} -> {:cont, {:ok, [{key, Type.encode(dumped)} | acc]}}
-        _ -> {:halt, {:error, {:bad_primary_key, key}}}
-      end
-    end)
-  end
+  # Two node patterns joined by a relationship pattern, as one fragment.
+  defp path_pattern(%Q.Fragment{parts: a}, hop, %Q.Fragment{parts: b}),
+    do: %Q.Fragment{parts: a ++ [hop] ++ b}
 
   # glider's internal node id, needed by the algorithms that take ids.
   defp node_id(record) do
-    resource = record.__struct__
-
-    with {:ok, pattern} <- node_pattern(record, "n") do
-      handle = Info.handle(resource)
-
-      case Glider.query(handle, "MATCH #{pattern} RETURN id(n)") do
+    with {:ok, n} <- node_pattern(record, :n) do
+      case Glider.query(handle(record), n |> Q.match() |> Q.return(id(n))) do
         {:ok, %{rows: [[id] | _]}} -> {:ok, id}
         {:ok, %{rows: []}} -> {:error, :not_found}
         {:error, reason} -> {:error, reason}
@@ -285,21 +238,21 @@ defmodule AshGlider.Edge do
   defp load_by_internal_ids(_handle, [], _resource), do: {:ok, []}
 
   defp load_by_internal_ids(handle, ids, resource) do
-    label = Info.label(resource)
+    q =
+      Q.vertex(:n, to_string(Info.label(resource)))
+      |> Q.match()
+      |> Q.where_fragment(["id(n) IN ", {:param, ids}])
+      |> Q.return([id(n), n])
 
-    # Preserve path order: glider returns rows in whatever order the pattern
-    # yields, but a path is only meaningful in sequence.
-    ids
-    |> Enum.reduce_while({:ok, []}, fn id, {:ok, acc} ->
-      case Glider.query(handle, "MATCH (n:#{label}) WHERE id(n) = #{id} RETURN n") do
-        {:ok, %{rows: [[node] | _]}} -> {:cont, {:ok, [node | acc]}}
-        {:ok, %{rows: []}} -> {:cont, {:ok, acc}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, nodes} -> load_nodes(Enum.map(Enum.reverse(nodes), &[&1]), resource)
-      error -> error
+    case Glider.query(handle, q) do
+      {:ok, %{rows: rows}} ->
+        # One query for the whole path, then back into path order: a path is
+        # only meaningful in sequence.
+        by_id = Map.new(rows, fn [id, node] -> {id, node} end)
+        ids |> Enum.flat_map(&List.wrap(by_id[&1])) |> Enum.map(&[&1]) |> load_nodes(resource)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

@@ -66,19 +66,32 @@ defmodule AshGlider.DataLayer do
 
   ## What is pushed down, and what is not
 
-  Simple equality on an attribute becomes part of the `MATCH` pattern, so an
-  indexed attribute is a seek rather than a scan. Everything else — `or`,
-  comparisons, expressions, relationship filters — is evaluated in Elixir by
-  `Ash.Filter.Runtime`, the same way the ETS and Mnesia data layers work.
+  glider stores the graph in pages on disk, so work the engine can skip is
+  IO that never happens. The filter is pushed into the query where the
+  translation is exact:
 
-  That is an honest trade rather than a limitation to work around. glider is
-  memory-resident and reads never touch disk, so a label scan is a walk over
-  memory, not IO. Pushing the whole of Ash's expression language into Cypher
-  would buy little and be wrong in more places.
+    * `attr == value` joins the `MATCH` pattern, so an indexed attribute is a
+      seek rather than a scan
+    * `<`, `<=`, `>`, `>=` on integer, float and string attributes, `in` and
+      `is_nil` become `WHERE` conditions
+    * `or` is pushed when both sides are
 
-  The consequence worth knowing: **cost is proportional to the number of nodes
-  carrying the label**, not to the number of rows returned. Index the
-  attributes you filter on by equality.
+  Every value travels as a query parameter, never as spliced text. Anything
+  else — `not`, `!=`, expressions, relationship paths, types whose stored form
+  does not compare like the original (case-insensitive strings, maps,
+  datetimes) — is left to `Ash.Filter.Runtime`, which is applied to the rows
+  afterwards in any case. A missed pushdown costs speed, never correctness.
+
+  When the whole filter is pushed down and the query is not sorted, `limit`
+  and `offset` are pushed too, so reading ten records reads ten nodes.
+
+  Index the attributes you filter on by equality.
+
+  ## Transactions
+
+  Ash actions run inside glider transactions: a failed action rolls back
+  everything it wrote, and a transaction belongs to the process that opened
+  it, so concurrent requests never see each other's half-finished work.
 
   ## Graph-native work
 
@@ -88,6 +101,8 @@ defmodule AshGlider.DataLayer do
   """
 
   use Spark.Dsl.Extension, sections: [@graph_section]
+
+  require Glider.Query, as: Q
 
   alias AshGlider.{Info, Type}
   alias Ash.Actions.Sort
@@ -144,11 +159,7 @@ defmodule AshGlider.DataLayer do
   def can?(_, :aggregate_filter), do: true
   def can?(_, :aggregate_sort), do: true
 
-  # glider has BEGIN/COMMIT, but a rollback that must also undo in-memory state
-  # is not something this layer can honestly promise yet. Saying `false` makes
-  # Ash run actions without a transaction rather than trusting one that would
-  # not hold.
-  def can?(_, :transact), do: false
+  def can?(_, :transact), do: true
 
   def can?(_, _), do: false
 
@@ -200,7 +211,17 @@ defmodule AshGlider.DataLayer do
 
   @doc false
   @impl true
-  def in_transaction?(_), do: false
+  def transaction(resource, fun, _timeout, _reason) do
+    Glider.transaction(Info.handle(resource), fun)
+  end
+
+  @doc false
+  @impl true
+  def rollback(resource, value), do: Glider.rollback(Info.handle(resource), value)
+
+  @doc false
+  @impl true
+  def in_transaction?(resource), do: Glider.in_transaction?(Info.handle(resource))
 
   @doc false
   @impl true
@@ -223,7 +244,10 @@ defmodule AshGlider.DataLayer do
       calculations: calculations
     } = query
 
-    with {:ok, records} <- fetch(resource, filter),
+    page = if sort in [nil, []], do: {offset || 0, limit}, else: nil
+
+    with {:ok, records, paged?} <- fetch(resource, filter, page),
+         {offset, limit} = if(paged?, do: {0, nil}, else: {offset, limit}),
          {:ok, filtered} <-
            filter_matches(records, filter, domain, tenant, context[:private][:actor]),
          sorted <- filtered |> Sort.runtime_sort(sort, domain: domain) |> Enum.drop(offset || 0),
@@ -289,87 +313,186 @@ defmodule AshGlider.DataLayer do
 
   # ---------------------------------------------------------------- storage
 
-  # Read the nodes for a resource, pushing simple equality down into the MATCH
-  # pattern where we can. See the moduledoc on what is and is not pushed down.
-  defp fetch(resource, filter) do
+  # Read the nodes for a resource, pushing as much of the filter into the
+  # query as translates exactly. `page` is {offset, limit} when the caller
+  # would slice an unsorted result; it is pushed down only when the whole
+  # filter was, and the third element says whether it was.
+  defp fetch(resource, filter, page) do
     label = Info.label(resource)
     handle = Info.handle(resource)
     ensure_indexes(resource, handle, label)
 
-    pattern =
-      case pushdown(filter, resource) do
-        [] -> "(n:#{label})"
-        pairs -> "(n:#{label} {#{Enum.map_join(pairs, ", ", fn {k, v} -> "#{k}: #{v}" end)}})"
+    {eq, conds, complete?} = pushdown(filter, resource)
+
+    q =
+      Q.vertex(:n, to_string(label), eq)
+      |> Q.match()
+      |> then(&Enum.reduce(conds, &1, fn parts, q -> Q.where_fragment(q, parts) end))
+      |> Q.return(n)
+
+    {q, paged?} =
+      case page do
+        {offset, limit} when complete? ->
+          q = if offset > 0, do: Q.skip(q, ^offset), else: q
+          {if(limit, do: Q.limit(q, ^limit), else: q), true}
+
+        _ ->
+          {q, false}
       end
 
-    case Glider.query(handle, "MATCH #{pattern} RETURN n") do
+    case Glider.query(handle, q) do
       {:ok, %{rows: rows}} ->
-        rows
-        |> Enum.map(fn [%Glider.Node{props: props}] -> props end)
-        |> cast_all(resource)
+        with {:ok, records} <-
+               rows
+               |> Enum.map(fn [%Glider.Node{props: props}] -> props end)
+               |> cast_all(resource) do
+          {:ok, records, paged?}
+        end
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  # Only top-level `attribute == literal` conjuncts are pushed down. Anything
-  # else stays for the runtime filter, which is always applied afterwards — so
-  # a missed pushdown costs speed, never correctness.
-  defp pushdown(nil, _resource), do: []
+  # -> {equality props for the pattern, [where parts], every conjunct pushed?}
+  defp pushdown(nil, _resource), do: {%{}, [], true}
 
-  defp pushdown(%Ash.Filter{expression: expression}, resource),
-    do: pushdown_expr(expression, resource)
+  defp pushdown(%Ash.Filter{expression: expression}, resource) do
+    expression
+    |> conjuncts()
+    |> Enum.reduce({%{}, [], true}, fn expr, {eq, conds, complete?} ->
+      case pushdown_eq(expr, resource) do
+        {:ok, {name, value}} when not is_map_key(eq, name) ->
+          {Map.put(eq, name, value), conds, complete?}
 
-  defp pushdown(_, _resource), do: []
+        _ ->
+          case condition(expr, resource) do
+            {:ok, parts} -> {eq, conds ++ [parts], complete?}
+            :error -> {eq, conds, false}
+          end
+      end
+    end)
+  end
 
-  defp pushdown_expr(%Ash.Query.BooleanExpression{op: :and, left: left, right: right}, resource),
-    do: pushdown_expr(left, resource) ++ pushdown_expr(right, resource)
+  defp pushdown(_, _resource), do: {%{}, [], false}
 
-  defp pushdown_expr(
-         %Ash.Query.Operator.Eq{
-           left: %Ash.Query.Ref{attribute: attr, relationship_path: []},
-           right: value
-         },
-         resource
-       )
+  defp conjuncts(%Ash.Query.BooleanExpression{op: :and, left: l, right: r}),
+    do: conjuncts(l) ++ conjuncts(r)
+
+  defp conjuncts(nil), do: []
+  defp conjuncts(expr), do: [expr]
+
+  defp pushdown_eq(%Ash.Query.Operator.Eq{left: %Ash.Query.Ref{} = ref, right: value}, resource)
        when not is_struct(value, Ash.Query.Ref) do
-    with %{name: name, type: type, constraints: constraints} <- attribute(resource, attr),
-         {:ok, dumped} <- Ash.Type.dump_to_native(type, value, constraints),
-         encoded when not is_nil(encoded) <- Type.encode(dumped),
-         {:ok, literal} <- cypher_literal(encoded) do
-      [{name, literal}]
+    with {:ok, attr} <- plain_attribute(ref, resource),
+         true <- attr_kind(attr) in [:ordered, :exact],
+         {:ok, encoded} <- encode_value(attr, value) do
+      {:ok, {attr.name, encoded}}
     else
-      _ -> []
+      _ -> :error
     end
   end
 
-  defp pushdown_expr(_, _resource), do: []
+  defp pushdown_eq(_, _resource), do: :error
 
-  defp attribute(_resource, %{name: _} = attr), do: attr
+  @comparisons %{
+    Ash.Query.Operator.GreaterThan => " > ",
+    Ash.Query.Operator.GreaterThanOrEqual => " >= ",
+    Ash.Query.Operator.LessThan => " < ",
+    Ash.Query.Operator.LessThanOrEqual => " <= "
+  }
 
-  defp attribute(resource, name) when is_atom(name),
-    do: Ash.Resource.Info.attribute(resource, name)
+  # A WHERE condition, as Cypher parts, or :error when it does not translate
+  # exactly.
+  defp condition(%Ash.Query.BooleanExpression{op: op, left: l, right: r}, resource) do
+    with {:ok, lp} <- condition(l, resource),
+         {:ok, rp} <- condition(r, resource) do
+      kw = if op == :and, do: ") AND (", else: ") OR ("
+      {:ok, ["("] ++ lp ++ [kw] ++ rp ++ [")"]}
+    end
+  end
 
-  defp attribute(_, _), do: nil
+  defp condition(%Ash.Query.Operator.Eq{left: %Ash.Query.Ref{}} = expr, resource) do
+    with {:ok, {name, value}} <- pushdown_eq(expr, resource),
+         do: {:ok, [prop(name), " = ", {:param, value}]}
+  end
 
-  defp cypher_literal(v) when is_integer(v) or is_float(v), do: {:ok, to_string(v)}
-  defp cypher_literal(true), do: {:ok, "true"}
-  defp cypher_literal(false), do: {:ok, "false"}
-  defp cypher_literal(v) when is_binary(v), do: {:ok, quote_string(v)}
-  defp cypher_literal(_), do: :error
+  defp condition(%mod{left: %Ash.Query.Ref{} = ref, right: value}, resource)
+       when is_map_key(@comparisons, mod) and not is_struct(value, Ash.Query.Ref) do
+    with {:ok, attr} <- plain_attribute(ref, resource),
+         :ordered <- attr_kind(attr),
+         {:ok, encoded} <- encode_value(attr, value) do
+      {:ok, [prop(attr.name), @comparisons[mod], {:param, encoded}]}
+    else
+      _ -> :error
+    end
+  end
 
-  @doc false
-  def quote_string(value) do
-    escaped =
-      value
-      |> String.replace("\\", "\\\\")
-      |> String.replace("\"", "\\\"")
-      |> String.replace("\n", "\\n")
-      |> String.replace("\r", "\\r")
-      |> String.replace("\t", "\\t")
+  defp condition(%Ash.Query.Operator.In{left: %Ash.Query.Ref{} = ref, right: values}, resource) do
+    with {:ok, attr} <- plain_attribute(ref, resource),
+         true <- attr_kind(attr) in [:ordered, :exact],
+         list when is_list(list) <- values |> Enum.to_list() |> encode_all(attr) do
+      {:ok, [prop(attr.name), " IN ", {:param, list}]}
+    else
+      _ -> :error
+    end
+  end
 
-    "\"" <> escaped <> "\""
+  defp condition(%Ash.Query.Operator.IsNil{left: %Ash.Query.Ref{} = ref, right: nil?}, resource)
+       when is_boolean(nil?) do
+    with {:ok, attr} <- plain_attribute(ref, resource) do
+      {:ok, [prop(attr.name), if(nil?, do: " IS NULL", else: " IS NOT NULL")]}
+    end
+  end
+
+  defp condition(_, _resource), do: :error
+
+  defp prop(name), do: "n." <> Q.ident(name)
+
+  defp plain_attribute(%Ash.Query.Ref{attribute: attr, relationship_path: []}, resource) do
+    case attr do
+      %Ash.Resource.Attribute{} = a -> {:ok, a}
+      name when is_atom(name) -> wrap_attr(Ash.Resource.Info.attribute(resource, name))
+      _ -> :error
+    end
+  end
+
+  defp plain_attribute(_, _resource), do: :error
+
+  defp wrap_attr(nil), do: :error
+  defp wrap_attr(attr), do: {:ok, attr}
+
+  # How an attribute's stored form compares. :ordered - equality and order
+  # both match the original (numbers, text); :exact - equality only (the
+  # encoding is one-to-one); anything else is not pushed down.
+  defp attr_kind(%{type: type}) do
+    case Ash.Type.get_type(type) do
+      t when t in [Ash.Type.Integer, Ash.Type.Float, Ash.Type.String] -> :ordered
+      t when t in [Ash.Type.Boolean, Ash.Type.Atom, Ash.Type.UUID, Ash.Type.UUIDv7, Ash.Type.Date] -> :exact
+      _ -> :other
+    end
+  end
+
+  defp encode_value(attr, value) do
+    with {:ok, dumped} <- Ash.Type.dump_to_native(attr.type, value, attr.constraints),
+         encoded when not is_nil(encoded) and not is_list(encoded) <- Type.encode(dumped) do
+      {:ok, encoded}
+    else
+      _ -> :error
+    end
+  end
+
+  defp encode_all(values, attr) do
+    Enum.reduce_while(values, [], fn v, acc ->
+      case encode_value(attr, v) do
+        {:ok, e} -> {:cont, [e | acc]}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      :error -> :error
+      list -> Enum.reverse(list)
+    end
   end
 
   defp cast_all(prop_maps, resource) do
@@ -399,12 +522,45 @@ defmodule AshGlider.DataLayer do
     end
   end
 
+  @doc false
+  @impl true
+  def bulk_create(resource, stream, options) do
+    handle = Info.handle(resource)
+
+    # One transaction for the batch: a failure part-way leaves nothing behind,
+    # and glider commits the whole batch to its log at once.
+    result =
+      Glider.transaction(handle, fn ->
+        Enum.map(stream, fn changeset ->
+          with {:ok, record} <- Ash.Changeset.apply_attributes(changeset),
+               {:ok, props} <- dump(record, resource),
+               :ok <- do_create(resource, props) do
+            record
+            |> set_loaded(resource)
+            |> Ash.Actions.Helpers.Bulk.put_metadata(changeset)
+          else
+            {:error, error} -> Glider.rollback(handle, error)
+          end
+        end)
+      end)
+
+    case result do
+      {:ok, records} -> if options[:return_records?], do: {:ok, records}, else: :ok
+      {:error, error} -> {:error, Ash.Error.to_ash_error(error)}
+    end
+  end
+
   defp do_create(resource, props) do
     handle = Info.handle(resource)
     label = Info.label(resource)
     ensure_indexes(resource, handle, label)
 
-    case Glider.query(handle, "CREATE (n:#{label} {#{property_literals(props)}})") do
+    # A nil property is simply absent from the node, which is how glider
+    # represents "unset" — writing an explicit null would make `IS NULL` and
+    # `keys()` disagree.
+    props = props |> Enum.reject(fn {_k, v} -> is_nil(v) end) |> Map.new()
+
+    case Glider.query(handle, Q.create(Q.vertex(:n, to_string(label), props))) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, Ash.Error.to_ash_error(reason)}
     end
@@ -415,16 +571,13 @@ defmodule AshGlider.DataLayer do
   def update(resource, changeset) do
     with {:ok, record} <- Ash.Changeset.apply_attributes(changeset),
          {:ok, props} <- dump(record, resource),
-         {:ok, match} <- pk_match(changeset.data, resource) do
-      handle = Info.handle(resource)
-      label = Info.label(resource)
+         {:ok, pk} <- pk_props(changeset.data, resource) do
+      q =
+        Q.vertex(:n, to_string(Info.label(resource)), pk)
+        |> Q.match()
+        |> Q.set_props(:n, props)
 
-      sets =
-        props
-        |> Enum.map(fn {k, v} -> "n.#{k} = #{literal_or_null(v)}" end)
-        |> Enum.join(", ")
-
-      case Glider.query(handle, "MATCH (n:#{label} {#{match}}) SET #{sets}") do
+      case Glider.query(Info.handle(resource), q) do
         {:ok, %{touched: 0}} -> {:error, not_found(changeset.data, resource)}
         {:ok, _} -> {:ok, set_loaded(record, resource)}
         {:error, reason} -> {:error, Ash.Error.to_ash_error(reason)}
@@ -435,13 +588,15 @@ defmodule AshGlider.DataLayer do
   @doc false
   @impl true
   def destroy(resource, %{data: record}) do
-    with {:ok, match} <- pk_match(record, resource) do
-      handle = Info.handle(resource)
-      label = Info.label(resource)
-
+    with {:ok, pk} <- pk_props(record, resource) do
       # DETACH so a node's edges go with it; leaving dangling relationships
       # behind would corrupt every traversal through this node.
-      case Glider.query(handle, "MATCH (n:#{label} {#{match}}) DETACH DELETE n") do
+      q =
+        Q.vertex(:n, to_string(Info.label(resource)), pk)
+        |> Q.match()
+        |> Q.delete(:n, detach: true)
+
+      case Glider.query(Info.handle(resource), q) do
         {:ok, _} -> :ok
         {:error, reason} -> {:error, Ash.Error.to_ash_error(reason)}
       end
@@ -460,48 +615,19 @@ defmodule AshGlider.DataLayer do
     end
   end
 
-  # A nil property is simply absent from the node, which is how glider
-  # represents "unset" — writing an explicit null would make `IS NULL` and
-  # `keys()` disagree.
-  defp property_literals(props) do
-    props
-    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
-    |> Enum.map_join(", ", fn {k, v} -> "#{k}: #{value_literal(v)}" end)
-  end
+  @doc false
+  # The record's primary key as encoded properties, for a MATCH pattern.
+  def pk_props(record, resource) do
+    resource
+    |> Ash.Resource.Info.primary_key()
+    |> Enum.reduce_while({:ok, %{}}, fn key, {:ok, acc} ->
+      attr = Ash.Resource.Info.attribute(resource, key)
 
-  defp literal_or_null(nil), do: "null"
-  defp literal_or_null(v), do: value_literal(v)
-
-  defp value_literal(v) when is_binary(v), do: quote_string(v)
-  defp value_literal(v) when is_integer(v) or is_float(v), do: to_string(v)
-  defp value_literal(true), do: "true"
-  defp value_literal(false), do: "false"
-
-  defp value_literal(v) when is_list(v),
-    do: "[" <> Enum.map_join(v, ", ", &value_literal/1) <> "]"
-
-  defp value_literal(nil), do: "null"
-
-  defp pk_match(record, resource) do
-    pk = Ash.Resource.Info.primary_key(resource)
-
-    pairs =
-      Enum.reduce_while(pk, {:ok, []}, fn key, {:ok, acc} ->
-        attr = Ash.Resource.Info.attribute(resource, key)
-
-        case Ash.Type.dump_to_native(attr.type, Map.get(record, key), attr.constraints) do
-          {:ok, dumped} -> {:cont, {:ok, [{key, Type.encode(dumped)} | acc]}}
-          _ -> {:halt, {:error, "could not encode primary key #{key}"}}
-        end
-      end)
-
-    case pairs do
-      {:ok, pairs} ->
-        {:ok, Enum.map_join(pairs, ", ", fn {k, v} -> "#{k}: #{value_literal(v)}" end)}
-
-      {:error, reason} ->
-        {:error, Ash.Error.to_ash_error(reason)}
-    end
+      case Ash.Type.dump_to_native(attr.type, Map.get(record, key), attr.constraints) do
+        {:ok, dumped} when not is_nil(dumped) -> {:cont, {:ok, Map.put(acc, key, Type.encode(dumped))}}
+        _ -> {:halt, {:error, Ash.Error.to_ash_error("could not encode primary key #{key}")}}
+      end
+    end)
   end
 
   defp not_found(record, resource) do
@@ -515,23 +641,29 @@ defmodule AshGlider.DataLayer do
     %{record | __meta__: %Ecto.Schema.Metadata{state: :loaded, schema: resource}}
   end
 
-  # Indexes are created lazily on first use and recorded in glider's log, so
+  # Indexes are created lazily on first use and stored in the database, so
   # this is a no-op after the first call. Doing it here rather than in a
-  # migration keeps the extension free of setup steps.
+  # migration keeps the extension free of setup steps. Inside a transaction it
+  # waits: a rollback would take the index with it.
   defp ensure_indexes(resource, handle, label) do
     key = {__MODULE__, :indexed, resource}
 
-    if :persistent_term.get(key, false) do
-      :ok
-    else
-      pk = Ash.Resource.Info.primary_key(resource)
+    cond do
+      :persistent_term.get(key, false) ->
+        :ok
 
-      for attr <- Enum.uniq(pk ++ Info.index(resource)) do
-        Glider.query(handle, "INDEX ON :#{label}(#{attr})")
-      end
+      Glider.in_transaction?(handle) ->
+        :ok
 
-      :persistent_term.put(key, true)
-      :ok
+      true ->
+        pk = Ash.Resource.Info.primary_key(resource)
+
+        for attr <- Enum.uniq(pk ++ Info.index(resource)) do
+          Glider.query(handle, "INDEX ON :#{Q.ident(to_string(label))}(#{Q.ident(attr)})")
+        end
+
+        :persistent_term.put(key, true)
+        :ok
     end
   end
 end

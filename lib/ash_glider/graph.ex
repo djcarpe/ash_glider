@@ -14,7 +14,14 @@ defmodule AshGlider.Graph do
 
       config :my_app, MyApp.Graph,
         path: "priv/graph/my_app.gldb",
-        sync: :normal
+        sync: :normal,
+        cache_size: "1G",
+        work_mem: "256M",
+        checkpoint: "256M"
+
+  Every option but `:path` is passed to `Glider.open/2`: the database can
+  grow far beyond RAM, with memory held near `:cache_size`. An in-memory
+  graph takes `:max_memory` instead.
 
   ## Why a process, when the handle is already safe to share
 
@@ -55,6 +62,9 @@ defmodule AshGlider.Graph do
 
       @doc "This graph's configuration, from the application environment."
       def config, do: Application.get_env(@otp_app, __MODULE__, [])
+
+      @doc "Fold the write-ahead log into the database pages now."
+      def checkpoint, do: Glider.checkpoint(handle())
 
       @doc "Start outside a supervision tree. Useful in tests and scripts."
       def start_link(opts \\ []) do
@@ -126,23 +136,18 @@ defmodule AshGlider.Graph.Server do
     end
   end
 
+  @file_opts [:sync, :cache_size, :work_mem, :checkpoint]
+
   defp open(config) do
     case Keyword.get(config, :path) do
-      nil -> Glider.open()
-      path -> Glider.open(path, Keyword.get(config, :sync, :normal))
+      nil -> Glider.open(Keyword.take(config, [:max_memory]))
+      path -> Glider.open(path, Keyword.take(config, @file_opts))
     end
   end
 
   @impl true
   def handle_call(:handle, _from, state), do: {:reply, state.handle, state}
 
-  def handle_call(:checkpoint, _from, state) do
-    {:reply, Glider.checkpoint(state.handle), state}
-  end
-
-  def handle_call(:compact, _from, state) do
-    {:reply, Glider.compact(state.handle), state}
-  end
 
   @impl true
   def terminate(_reason, state) do

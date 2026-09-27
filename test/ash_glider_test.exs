@@ -357,4 +357,123 @@ defmodule AshGliderTest do
       assert AshGlider.DataLayer.source(Person) == "Person"
     end
   end
+  describe "pushdown" do
+    setup do
+      create!(%{name: "Ada", email: "ada@example.com", age: 36, role: :admin, score: 9.5})
+      create!(%{name: "Bob", email: "bob@example.com", age: 41, role: :member})
+      create!(%{name: "Cai", age: 28, role: :member, score: 3.0})
+      create!(%{name: "Dee"})
+      :ok
+    end
+
+    defp names(query), do: query |> Ash.read!() |> Enum.map(& &1.name) |> Enum.sort()
+
+    test "comparisons skip nodes whose property is unset" do
+      assert names(Ash.Query.filter(Person, age >= 36)) == ["Ada", "Bob"]
+      assert names(Ash.Query.filter(Person, age < 36)) == ["Cai"]
+      assert names(Ash.Query.filter(Person, score > 1.0 and score <= 9.5)) == ["Ada", "Cai"]
+      assert names(Ash.Query.filter(Person, name > "B")) == ["Bob", "Cai", "Dee"]
+    end
+
+    test "in and is_nil" do
+      assert names(Ash.Query.filter(Person, name in ["Ada", "Dee", "Zed"])) == ["Ada", "Dee"]
+      assert names(Ash.Query.filter(Person, role in [:admin])) == ["Ada"]
+      assert names(Ash.Query.filter(Person, is_nil(email))) == ["Cai", "Dee"]
+      assert names(Ash.Query.filter(Person, not is_nil(score))) == ["Ada", "Cai"]
+    end
+
+    test "or across different attributes" do
+      assert names(Ash.Query.filter(Person, age > 40 or is_nil(age))) == ["Bob", "Dee"]
+    end
+
+    test "filters that stay in Elixir still apply alongside pushed ones" do
+      # `!=` and `not` are not pushed (nil semantics differ); both must hold.
+      assert names(Ash.Query.filter(Person, age > 20 and name != "Ada")) == ["Bob", "Cai"]
+      assert names(Ash.Query.filter(Person, not (age > 30))) == ["Cai"]
+      assert names(Ash.Query.filter(Person, contains(name, "i") and age < 40)) == ["Cai"]
+    end
+
+    test "limit and offset without a sort, with and without a pushed filter" do
+      all = Person |> Ash.read!() |> Enum.map(& &1.name) |> MapSet.new()
+
+      page1 = Person |> Ash.Query.limit(2) |> Ash.read!() |> Enum.map(& &1.name)
+      page2 = Person |> Ash.Query.limit(2) |> Ash.Query.offset(2) |> Ash.read!() |> Enum.map(& &1.name)
+      assert length(page1) == 2 and length(page2) == 2
+      assert MapSet.new(page1 ++ page2) == all
+
+      assert [_] = Person |> Ash.Query.filter(role == :member) |> Ash.Query.limit(1) |> Ash.read!()
+
+      # A filter that cannot be pushed must see every row before the limit.
+      assert ["Cai"] =
+               Person
+               |> Ash.Query.filter(contains(name, "i") and age < 40)
+               |> Ash.Query.limit(1)
+               |> Ash.read!()
+               |> Enum.map(& &1.name)
+    end
+  end
+
+  describe "transactions" do
+    # Inside a bare data-layer transaction nothing sends Ash's notifications,
+    # so collect them rather than have Ash warn that they were missed.
+    defp create_in_tx!(attrs) do
+      {record, _notifications} =
+        Person
+        |> Ash.Changeset.for_create(:create, attrs)
+        |> Ash.create!(return_notifications?: true)
+
+      record
+    end
+
+    test "a failed step rolls back everything written in the transaction" do
+      result =
+        Ash.DataLayer.transaction(Person, fn ->
+          create_in_tx!(%{name: "Ada"})
+          create_in_tx!(%{name: "Bob"})
+          Ash.DataLayer.rollback(Person, :changed_my_mind)
+        end)
+
+      assert result == {:error, :changed_my_mind}
+      assert Ash.read!(Person) == []
+    end
+
+    test "a committed transaction keeps its writes" do
+      assert {:ok, _} =
+               Ash.DataLayer.transaction(Person, fn ->
+                 create_in_tx!(%{name: "Ada"})
+                 create_in_tx!(%{name: "Bob"})
+               end)
+
+      assert length(Ash.read!(Person)) == 2
+    end
+
+    test "the data layer reports the transaction it is in" do
+      refute Ash.DataLayer.in_transaction?(Person)
+
+      Ash.DataLayer.transaction(Person, fn ->
+        assert Ash.DataLayer.in_transaction?(Person)
+      end)
+    end
+  end
+
+  describe "bulk create" do
+    test "creates every record and returns them in order" do
+      inputs = for i <- 1..50, do: %{name: "P#{i}", age: i}
+
+      result = Ash.bulk_create(inputs, Person, :create, return_records?: true, return_errors?: true)
+
+      assert result.status == :success
+      assert Enum.map(result.records, & &1.name) |> Enum.sort() == Enum.map(inputs, & &1.name) |> Enum.sort()
+      assert length(Ash.read!(Person)) == 50
+    end
+
+    test "an invalid record fails the batch without leaving part of it" do
+      inputs = [%{name: "Ok"}, %{name: nil}]
+
+      result = Ash.bulk_create(inputs, Person, :create, return_errors?: true, stop_on_error?: true)
+
+      assert result.status == :error
+      assert Ash.read!(Person) |> Enum.map(& &1.name) |> Enum.reject(&(&1 == "Ok")) == []
+    end
+  end
 end
