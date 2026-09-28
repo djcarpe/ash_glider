@@ -8,7 +8,9 @@ defmodule AshGlider.MixProject do
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      elixirc_paths: elixirc_paths(Mix.env())
+      elixirc_paths: elixirc_paths(Mix.env()),
+      description: "An Ash data layer for glider, an embeddable property-graph database.",
+      package: [licenses: ["MIT"], files: ~w(lib mix.exs README.md LICENSE)]
     ]
   end
 
