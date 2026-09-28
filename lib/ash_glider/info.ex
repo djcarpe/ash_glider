@@ -52,7 +52,15 @@ defmodule AshGlider.Info do
     end
   end
 
-  @doc "The live glider handle backing a resource."
+  @doc """
+  The live glider handle backing a resource, for the tenant of the operation
+  in progress (see `AshGlider.Tenant`), or the graph's one handle when the
+  graph does not distinguish tenants.
+  """
   @spec handle(Ash.Resource.t()) :: term()
-  def handle(resource), do: resource |> graph() |> AshGlider.Graph.handle()
+  def handle(resource), do: handle(resource, AshGlider.Tenant.current())
+
+  @doc "The live glider handle backing a resource for one tenant."
+  @spec handle(Ash.Resource.t(), term()) :: term()
+  def handle(resource, tenant), do: resource |> graph() |> then(& &1.handle(tenant))
 end

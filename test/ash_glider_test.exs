@@ -357,6 +357,7 @@ defmodule AshGliderTest do
       assert AshGlider.DataLayer.source(Person) == "Person"
     end
   end
+
   describe "pushdown" do
     setup do
       create!(%{name: "Ada", email: "ada@example.com", age: 36, role: :admin, score: 9.5})
@@ -397,11 +398,15 @@ defmodule AshGliderTest do
       all = Person |> Ash.read!() |> Enum.map(& &1.name) |> MapSet.new()
 
       page1 = Person |> Ash.Query.limit(2) |> Ash.read!() |> Enum.map(& &1.name)
-      page2 = Person |> Ash.Query.limit(2) |> Ash.Query.offset(2) |> Ash.read!() |> Enum.map(& &1.name)
+
+      page2 =
+        Person |> Ash.Query.limit(2) |> Ash.Query.offset(2) |> Ash.read!() |> Enum.map(& &1.name)
+
       assert length(page1) == 2 and length(page2) == 2
       assert MapSet.new(page1 ++ page2) == all
 
-      assert [_] = Person |> Ash.Query.filter(role == :member) |> Ash.Query.limit(1) |> Ash.read!()
+      assert [_] =
+               Person |> Ash.Query.filter(role == :member) |> Ash.Query.limit(1) |> Ash.read!()
 
       # A filter that cannot be pushed must see every row before the limit.
       assert ["Cai"] =
@@ -460,17 +465,22 @@ defmodule AshGliderTest do
     test "creates every record and returns them in order" do
       inputs = for i <- 1..50, do: %{name: "P#{i}", age: i}
 
-      result = Ash.bulk_create(inputs, Person, :create, return_records?: true, return_errors?: true)
+      result =
+        Ash.bulk_create(inputs, Person, :create, return_records?: true, return_errors?: true)
 
       assert result.status == :success
-      assert Enum.map(result.records, & &1.name) |> Enum.sort() == Enum.map(inputs, & &1.name) |> Enum.sort()
+
+      assert Enum.map(result.records, & &1.name) |> Enum.sort() ==
+               Enum.map(inputs, & &1.name) |> Enum.sort()
+
       assert length(Ash.read!(Person)) == 50
     end
 
     test "an invalid record fails the batch without leaving part of it" do
       inputs = [%{name: "Ok"}, %{name: nil}]
 
-      result = Ash.bulk_create(inputs, Person, :create, return_errors?: true, stop_on_error?: true)
+      result =
+        Ash.bulk_create(inputs, Person, :create, return_errors?: true, stop_on_error?: true)
 
       assert result.status == :error
       assert Ash.read!(Person) |> Enum.map(& &1.name) |> Enum.reject(&(&1 == "Ok")) == []

@@ -44,7 +44,10 @@ defmodule AshGlider.Edge do
   def relate(from, type, to, props \\ %{}) do
     with {:ok, a} <- node_pattern(from, :a),
          {:ok, b} <- node_pattern(to, :b) do
-      props = props |> Enum.reject(fn {_k, v} -> is_nil(v) end) |> Map.new(fn {k, v} -> {k, Type.encode(v)} end)
+      props =
+        props
+        |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+        |> Map.new(fn {k, v} -> {k, Type.encode(v)} end)
 
       q =
         a
@@ -67,7 +70,10 @@ defmodule AshGlider.Edge do
   def unrelate(from, type, to) do
     with {:ok, a} <- node_pattern(from, :a),
          {:ok, b} <- node_pattern(to, :b) do
-      q = path_pattern(a, "-[r:" <> Q.ident(to_string(type)) <> "]->", b) |> Q.match() |> Q.delete(:r)
+      q =
+        path_pattern(a, "-[r:" <> Q.ident(to_string(type)) <> "]->", b)
+        |> Q.match()
+        |> Q.delete(:r)
 
       case Glider.query(handle(from), q) do
         {:ok, %{touched: n}} -> {:ok, n}
@@ -105,7 +111,9 @@ defmodule AshGlider.Edge do
           :both -> {"-", "-"}
         end
 
-      hop = left <> "[:" <> Q.ident(to_string(type)) <> hop_spec(Keyword.get(opts, :depth)) <> "]" <> right
+      hop =
+        left <>
+          "[:" <> Q.ident(to_string(type)) <> hop_spec(Keyword.get(opts, :depth)) <> "]" <> right
 
       q =
         path_pattern(a, hop, Q.vertex(:b, to_string(Info.label(destination))))
@@ -194,7 +202,10 @@ defmodule AshGlider.Edge do
   """
   @spec algorithm(Ash.Resource.t(), atom(), keyword()) :: {:ok, list()} | {:error, term()}
   def algorithm(resource, name, args \\ []) do
-    args = Enum.map(args, fn {k, v} -> {k, if(is_atom(v) and not is_boolean(v), do: to_string(v), else: v)} end)
+    args =
+      Enum.map(args, fn {k, v} ->
+        {k, if(is_atom(v) and not is_boolean(v), do: to_string(v), else: v)}
+      end)
 
     case Glider.query(Info.handle(resource), Q.call(name, args)) do
       {:ok, result} -> {:ok, result.rows}
@@ -204,7 +215,9 @@ defmodule AshGlider.Edge do
 
   # ------------------------------------------------------------------ private
 
-  defp handle(record), do: Info.handle(record.__struct__)
+  # A record read under a tenant remembers it, so its edges go to that
+  # tenant's database.
+  defp handle(record), do: Info.handle(record.__struct__, record.__metadata__[:tenant])
 
   defp hop_spec(nil), do: ""
   defp hop_spec(first..last//_), do: "*#{first}..#{last}"

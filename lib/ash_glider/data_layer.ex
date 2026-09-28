@@ -159,7 +159,12 @@ defmodule AshGlider.DataLayer do
   def can?(_, :aggregate_filter), do: true
   def can?(_, :aggregate_sort), do: true
 
-  def can?(_, :transact), do: true
+  # A transaction is opened before the changeset — and its tenant — reaches
+  # this layer, so a graph with a database per tenant cannot pick one to
+  # transact on. Those resources do without: every write here is a single
+  # statement, committed to the log at once.
+  def can?(resource, :transact), do: is_nil(Ash.Resource.Info.multitenancy_strategy(resource))
+  def can?(_, :multitenancy), do: true
 
   def can?(_, _), do: false
 
@@ -221,7 +226,12 @@ defmodule AshGlider.DataLayer do
 
   @doc false
   @impl true
-  def in_transaction?(resource), do: Glider.in_transaction?(Info.handle(resource))
+  def in_transaction?(resource) do
+    Glider.in_transaction?(Info.handle(resource))
+  rescue
+    # Asked before any tenant is known: there is no transaction to be in.
+    RuntimeError -> false
+  end
 
   @doc false
   @impl true
@@ -243,6 +253,8 @@ defmodule AshGlider.DataLayer do
       aggregates: aggregates,
       calculations: calculations
     } = query
+
+    AshGlider.Tenant.put(tenant)
 
     page = if sort in [nil, []], do: {offset || 0, limit}, else: nil
 
@@ -467,9 +479,15 @@ defmodule AshGlider.DataLayer do
   # encoding is one-to-one); anything else is not pushed down.
   defp attr_kind(%{type: type}) do
     case Ash.Type.get_type(type) do
-      t when t in [Ash.Type.Integer, Ash.Type.Float, Ash.Type.String] -> :ordered
-      t when t in [Ash.Type.Boolean, Ash.Type.Atom, Ash.Type.UUID, Ash.Type.UUIDv7, Ash.Type.Date] -> :exact
-      _ -> :other
+      t when t in [Ash.Type.Integer, Ash.Type.Float, Ash.Type.String] ->
+        :ordered
+
+      t
+      when t in [Ash.Type.Boolean, Ash.Type.Atom, Ash.Type.UUID, Ash.Type.UUIDv7, Ash.Type.Date] ->
+        :exact
+
+      _ ->
+        :other
     end
   end
 
@@ -515,6 +533,8 @@ defmodule AshGlider.DataLayer do
   @doc false
   @impl true
   def create(resource, changeset) do
+    AshGlider.Tenant.put(changeset.tenant)
+
     with {:ok, record} <- Ash.Changeset.apply_attributes(changeset),
          {:ok, props} <- dump(record, resource),
          :ok <- do_create(resource, props) do
@@ -525,6 +545,7 @@ defmodule AshGlider.DataLayer do
   @doc false
   @impl true
   def bulk_create(resource, stream, options) do
+    AshGlider.Tenant.put(options[:tenant])
     handle = Info.handle(resource)
 
     # One transaction for the batch: a failure part-way leaves nothing behind,
@@ -569,6 +590,8 @@ defmodule AshGlider.DataLayer do
   @doc false
   @impl true
   def update(resource, changeset) do
+    AshGlider.Tenant.put(changeset.tenant)
+
     with {:ok, record} <- Ash.Changeset.apply_attributes(changeset),
          {:ok, props} <- dump(record, resource),
          {:ok, pk} <- pk_props(changeset.data, resource) do
@@ -587,7 +610,9 @@ defmodule AshGlider.DataLayer do
 
   @doc false
   @impl true
-  def destroy(resource, %{data: record}) do
+  def destroy(resource, %{data: record} = changeset) do
+    AshGlider.Tenant.put(changeset.tenant)
+
     with {:ok, pk} <- pk_props(record, resource) do
       # DETACH so a node's edges go with it; leaving dangling relationships
       # behind would corrupt every traversal through this node.
@@ -624,8 +649,11 @@ defmodule AshGlider.DataLayer do
       attr = Ash.Resource.Info.attribute(resource, key)
 
       case Ash.Type.dump_to_native(attr.type, Map.get(record, key), attr.constraints) do
-        {:ok, dumped} when not is_nil(dumped) -> {:cont, {:ok, Map.put(acc, key, Type.encode(dumped))}}
-        _ -> {:halt, {:error, Ash.Error.to_ash_error("could not encode primary key #{key}")}}
+        {:ok, dumped} when not is_nil(dumped) ->
+          {:cont, {:ok, Map.put(acc, key, Type.encode(dumped))}}
+
+        _ ->
+          {:halt, {:error, Ash.Error.to_ash_error("could not encode primary key #{key}")}}
       end
     end)
   end
@@ -646,7 +674,8 @@ defmodule AshGlider.DataLayer do
   # migration keeps the extension free of setup steps. Inside a transaction it
   # waits: a rollback would take the index with it.
   defp ensure_indexes(resource, handle, label) do
-    key = {__MODULE__, :indexed, resource}
+    # Per handle: a tenant's own database needs its own indexes.
+    key = {__MODULE__, :indexed, resource, AshGlider.Tenant.current()}
 
     cond do
       :persistent_term.get(key, false) ->

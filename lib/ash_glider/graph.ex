@@ -42,6 +42,17 @@ defmodule AshGlider.Graph do
   @doc "Fetch the graph handle. Raises if the process has not started."
   @callback handle() :: term()
 
+  @doc """
+  The handle for a tenant.
+
+  The default ignores the tenant and returns the module's one handle. A
+  graph that keeps one database per tenant — an organisation each, say —
+  overrides this to look the handle up, and its resources declare
+  `multitenancy do strategy :context end`. Writes and reads then go to the
+  tenant's database; nothing else in the data layer changes.
+  """
+  @callback handle(tenant :: term()) :: term()
+
   defmacro __using__(opts) do
     quote bind_quoted: [opts: opts] do
       @behaviour AshGlider.Graph
@@ -59,6 +70,11 @@ defmodule AshGlider.Graph do
 
       @impl AshGlider.Graph
       def handle, do: AshGlider.Graph.handle(__MODULE__)
+
+      @impl AshGlider.Graph
+      def handle(_tenant), do: handle()
+
+      defoverridable handle: 1
 
       @doc "This graph's configuration, from the application environment."
       def config, do: Application.get_env(@otp_app, __MODULE__, [])
@@ -147,7 +163,6 @@ defmodule AshGlider.Graph.Server do
 
   @impl true
   def handle_call(:handle, _from, state), do: {:reply, state.handle, state}
-
 
   @impl true
   def terminate(_reason, state) do
