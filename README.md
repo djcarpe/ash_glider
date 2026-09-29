@@ -127,6 +127,17 @@ null, which is how glider represents "unset".
   * **One writer per file.** A second `open` on the same path is refused while
     the first handle is alive.
 
+## Telemetry
+
+Every statement this data layer runs goes through `Glider.query/3`, so it
+emits glider_ex's `[:glider, :query, ...]` telemetry span, carrying the
+engine's own report: operation, rows, pages read and cache hits. Call
+`Glider.OpenTelemetry.setup/0` next to your other instrumentation and each
+Ash read or write shows its glider statements as `glider MATCH` / `glider
+CREATE` client spans, children of whatever span the action runs in. They
+include `db.query.text`, which is the Cypher the filter pushdown produced. See
+`Glider.Telemetry` for the metrics.
+
 ## Example app
 
 `examples/graph_explorer` is a Phoenix LiveView app built on this data layer.
